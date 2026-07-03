@@ -1,0 +1,32 @@
+{
+  "discord": {
+    "platform": "discord",
+    "status": "CAPTCHA_BLOCKED",
+    "cookies": "/home/ubuntu/epsilon-agent/app/sessions/discord_cookies.json",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/discord_session.png"
+  },
+  "bluesky": {
+    "platform": "bluesky",
+    "status": "REQUIRES_MANUAL",
+    "cookies": "/home/ubuntu/epsilon-agent/app/sessions/bluesky_cookies.json",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/bluesky_session.png"
+  },
+  "mastodon": {
+    "platform": "mastodon",
+    "status": "REQUIRES_MANUAL",
+    "cookies": "/home/ubuntu/epsilon-agent/app/sessions/mastodon_cookies.json",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/mastodon_session.png"
+  },
+  "lemmy": {
+    "platform": "lemmy",
+    "status": "COMPLETED",
+    "cookies": "/home/ubuntu/epsilon-agent/app/sessions/lemmy_cookies.json",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/lemmy_session.png"
+  },
+  "hackernews": {
+    "platform": "hackernews",
+    "status": "BAD_CREDENTIALS",
+    "cookies": "/home/ubuntu/epsilon-agent/app/sessions/hackernews_cookies.json",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/hackernews_session.png"
+  }
+}

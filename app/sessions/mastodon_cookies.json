@@ -1,0 +1,12 @@
+[
+  {
+    "name": "_mastodon_session",
+    "value": "cvZZuYd4GLF%2B59xANi%2F0aomn9BphWpffi4lEY2Yn%2Fgwo%2BiucIio7mlmwotdHVKSPA2NZTA13fyTekN1BcVOOsksN5Wx5ts4SocyhEbOwL8ho8teES5kYL8C6mBMKa18krHbR3NpW8LQLTvhko28fmBYEnvMzpsqp2OY03fZAzrQc%2FyQzEZDuLS%2FI0Q2xbudN6vzNBnsGAU4kMRJYCU%2F2qjKlMzEBt0QdOhD7q7f2s3TCbbhkVG9x7vJ7QxlOeM0FHKLi%2B4q%2BIAqBbzgwMvcTZoJJhlmYByHInQ%3D%3D--e7WaI6raeqEUBNHR--W27TjLuMXnManm2LG2W7yA%3D%3D",
+    "domain": "mastodon.social",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Lax"
+  }
+]
