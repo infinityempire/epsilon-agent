@@ -47,6 +47,14 @@ class SignupRequest(BaseModel):
         default=None,
         description="Optional metadata to attach to the task",
     )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Optional session ID to restore (for distributed workers)",
+    )
+    export_session: bool = Field(
+        default=False,
+        description="If true, export session after successful login",
+    )
 
     model_config = {
         "json_schema_extra": {

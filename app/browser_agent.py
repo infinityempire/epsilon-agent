@@ -1,10 +1,12 @@
 """Async Playwright browser automation for account creation."""
 import asyncio
+import json
 import logging
 import random
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -91,11 +93,24 @@ class InboxService:
 class BrowserAgent:
     """Async browser automation agent for account creation."""
 
+    # Browser launch arguments for stealth mode
+    BROWSER_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
+    ]
+
     def __init__(self) -> None:
         self._playwright: Optional[Playwright] = None
         self._browser_type: Optional[BrowserType] = None
         self._inbox_service = InboxService()
         self._context: Optional[BrowserContext] = None
+        self._browser = None
+        self._context_count = 0
+        self._max_contexts_before_refresh = 10  # Refresh browser after N contexts
 
     async def initialize(self) -> None:
         if self._playwright is None:
@@ -103,32 +118,85 @@ class BrowserAgent:
             self._browser_type = self._playwright.chromium
 
     async def cleanup(self) -> None:
+        """Clean up all browser resources."""
         if self._context:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:
+                pass
             self._context = None
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
             self._playwright = None
+        logger.info("BrowserAgent cleanup complete")
+
+    async def _refresh_context(self) -> None:
+        """Create a fresh browser context to avoid state pollution."""
+        logger.info("Refreshing browser context")
+        
+        # Close existing context
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+        
+        self._context_count += 1
+        
+        # Periodically refresh the entire browser to avoid memory leaks
+        if self._context_count >= self._max_contexts_before_refresh:
+            logger.info("Refreshing entire browser")
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+            self._context_count = 0
 
     async def _ensure_context(self) -> BrowserContext:
+        """Get or create a browser context with stealth settings."""
         if self._context is None:
-            browser = await self._browser_type.launch(
-                headless=settings.headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                ],
-            )
-            self._context = await browser.new_context(
+            # Launch browser if needed
+            if self._browser is None:
+                self._browser = await self._browser_type.launch(
+                    headless=settings.headless,
+                    args=self.BROWSER_ARGS,
+                )
+            
+            # Create context with realistic settings
+            self._context = await self._browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 user_agent=self._get_realistic_user_agent(),
                 locale="en-US",
+                timezone_id="America/New_York",
+                ignore_https_errors=True,
             )
+            
+            # Apply stealth scripts
             await self._context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
             """)
+            
+            # Set default timeout
+            self._context.set_default_timeout(settings.browser_timeout_ms)
+            self._context.set_default_navigation_timeout(settings.navigation_timeout_ms)
+            
+            logger.info(f"Created new browser context (count: {self._context_count})")
+        
         return self._context
 
     def _get_realistic_user_agent(self) -> str:
@@ -190,16 +258,51 @@ class BrowserAgent:
     # -----------------------------------------------------------------------
     # Public entry point
     # -----------------------------------------------------------------------
-    async def execute_signup(self, task_id: str, request: SignupRequest) -> AutomationResult:
+    async def execute_signup(
+        self,
+        task_id: str,
+        request: SignupRequest,
+        session_id: Optional[str] = None,
+        export_session: bool = False,
+    ) -> AutomationResult:
+        """
+        Execute signup/login flow for a given request.
+        
+        Args:
+            task_id: Unique task identifier
+            request: SignupRequest with credentials
+            session_id: Optional session ID to restore (for distributed workers)
+            export_session: If True, export session after successful login
+            
+        Returns:
+            AutomationResult with status and any error details
+        """
         page: Optional[Page] = None
+        platform_name = "unknown"
         try:
             await self.initialize()
             await self._inbox_service.setup_inbox(request.email)
             context = await self._ensure_context()
+            
+            # Import session if provided (for distributed worker session reuse)
+            if session_id:
+                from app.storage import session_manager
+                if await session_manager.import_session(platform_name, session_id, context):
+                    logger.info(f"Restored session {session_id}")
+            
             page = await context.new_page()
 
             target_url = str(request.target_url) if request.target_url else settings.mock_target_url
             hostname = urlparse(target_url).hostname or ""
+
+            # Detect platform from hostname
+            platform_name = self._detect_platform(hostname)
+            logger.info(f"[{platform_name.upper()}] Processing task {task_id}")
+
+            # Re-import session with correct platform after detection
+            if session_id:
+                from app.storage import session_manager
+                await session_manager.import_session(platform_name, session_id, context)
 
             # Resolve platform-specific handler
             handler_name = None
@@ -214,6 +317,25 @@ class BrowserAgent:
             else:
                 # Fallback: generic flow
                 result = await self._generic_signup(page, task_id, request, target_url)
+
+            # Export session if requested and login was successful
+            if export_session and result.status == TaskStatus.COMPLETED:
+                try:
+                    from app.storage import session_manager
+                    new_session_id = await session_manager.export_session(
+                        platform_name,
+                        context,
+                        metadata={
+                            "task_id": task_id,
+                            "email": request.email,
+                            "platform": platform_name,
+                        }
+                    )
+                    logger.info(f"Exported session {new_session_id} for {platform_name}")
+                    if result.result:
+                        result.result["session_id"] = new_session_id
+                except Exception as e:
+                    logger.warning(f"Failed to export session: {e}")
 
             await self._inbox_service.cleanup_inbox(request.email)
             return result
@@ -245,6 +367,22 @@ class BrowserAgent:
             if page:
                 await page.close()
 
+    def _detect_platform(self, hostname: str) -> str:
+        """Detect platform from hostname."""
+        platform_map = {
+            "bsky.app": "bluesky",
+            "joinmastodon.org": "mastodon",
+            "mastodon.social": "mastodon",
+            "join-lemmy.org": "lemmy",
+            "lemmy.world": "lemmy",
+            "news.ycombinator.com": "hackernews",
+            "discord.com": "discord",
+        }
+        for domain, platform in platform_map.items():
+            if domain in hostname:
+                return platform
+        return "generic"
+
     # -----------------------------------------------------------------------
     # Platform handlers
     # -----------------------------------------------------------------------
@@ -253,68 +391,127 @@ class BrowserAgent:
     async def _handle_bluesky(self, page: Page, task_id: str, request: SignupRequest) -> AutomationResult:
         """
         Bluesky login via https://bsky.app
-        Flow: navigate → wait for SPA → fill identifier + password → click Sign in
+        Flow: navigate → dismiss modal → wait for SPA → fill identifier + password → click Sign in
         The sign-in form is a React SPA; we wait for the input to appear.
         """
         logger.info("[Bluesky] Starting login flow")
         try:
             await page.goto("https://bsky.app", wait_until="domcontentloaded", timeout=30000)
-            await self._human_delay(2000, 3000)
+            await self._human_delay(2000, 4000)
 
             # Bluesky shows a welcome modal with a 'Sign in' link.
             # The modal has aria-modal=true and intercepts pointer events.
-            # We use dispatchEvent to bypass pointer-event blocking.
+            # First, dismiss any modal dialog by clicking outside or pressing Escape
             try:
-                await page.wait_for_selector(
-                    "a:has-text('Sign in'), button:has-text('Sign in')",
-                    timeout=10000
-                )
+                # Try pressing Escape to close modal
+                await page.keyboard.press("Escape")
+                await self._human_delay(500, 1000)
+            except Exception:
+                pass
+
+            # Try to find and click a dismiss/close button
+            try:
+                dismissed = await page.evaluate("""
+                    () => {
+                        // Try clicking backdrop to dismiss modal
+                        const backdrops = document.querySelectorAll('[data-testid*="backdrop"], .Overlay-backdrop, [class*="backdrop"]');
+                        for (const el of backdrops) {
+                            if (el.offsetParent !== null) {
+                                el.click();
+                                return 'backdrop';
+                            }
+                        }
+                        // Try clicking close button
+                        const closeBtns = document.querySelectorAll('[aria-label="Close"], [data-testid="closeModal"], button[class*="close"]');
+                        for (const btn of closeBtns) {
+                            if (btn.offsetParent !== null) {
+                                btn.click();
+                                return 'close-btn';
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if dismissed:
+                    logger.info(f"[Bluesky] Dismissed modal via: {dismissed}")
+                    await self._human_delay(1000, 2000)
+            except Exception:
+                pass  # Modal dismissal attempted
+
+            # Now try to click Sign in link using JS dispatch
+            try:
                 await page.evaluate("""
                     () => {
-                        const all = Array.from(document.querySelectorAll('a, button'));
-                        const si = all.find(el => el.textContent.trim() === 'Sign in');
-                        if (si) {
-                            si.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                        // Try multiple strategies to find Sign in button
+                        const strategies = [
+                            // Direct text match
+                            () => Array.from(document.querySelectorAll('a, button')).find(el => el.textContent.trim() === 'Sign in'),
+                            // aria-label match
+                            () => document.querySelector('[aria-label*="Sign in" i]'),
+                            // data-testid match
+                            () => document.querySelector('[data-testid*="signin" i]'),
+                        ];
+                        for (const strat of strategies) {
+                            const el = strat();
+                            if (el && el.offsetParent !== null) {
+                                el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                                return true;
+                            }
                         }
+                        return false;
                     }
                 """)
                 await self._human_delay(2000, 3000)
             except Exception:
-                pass  # Already on form
+                pass  # Sign in navigation attempted
+
+            # If still on main page, navigate directly to login
+            current_url = page.url
+            if "login" not in current_url:
+                await page.goto("https://bsky.app/login", wait_until="domcontentloaded", timeout=30000)
+                await self._human_delay(2000, 3000)
 
             # Wait for the identifier input to appear (SPA may need time)
             try:
                 await page.wait_for_selector(
-                    "input[data-testid='loginUsernameInput'], input[placeholder*='username' i], input[placeholder*='handle' i], input[autocomplete='username']",
-                    timeout=10000, state="visible"
+                    "input[data-testid='loginUsernameInput'], input[placeholder*='username' i], input[placeholder*='handle' i], input[autocomplete='username'], input[type='text']",
+                    timeout=15000, state="visible"
                 )
-            except Exception:
-                pass
+            except PlaywrightTimeout:
+                sp = await self._take_screenshot(page, task_id, "bluesky_no_input")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message="Bluesky: login form inputs not found", screenshot_path=sp)
 
-            # Identifier field
+            # Identifier field - extract handle from email
+            handle = request.email.split("@")[0] if "@" in request.email else request.email
             filled_id = await self._type(
                 page,
-                "input[data-testid='loginUsernameInput'], input[placeholder*='username' i], input[placeholder*='handle' i], input[autocomplete='username']",
-                request.email
+                "input[data-testid='loginUsernameInput'], input[placeholder*='username' i], input[placeholder*='handle' i], input[autocomplete='username'], input[type='text']",
+                handle + ".bsky.social"
             )
             if not filled_id:
-                # Try generic text input
-                await self._type(page, "input[type='text']:visible", request.email)
+                # Try with just the handle
+                await self._type(page, "input[type='text']", handle)
             await self._human_delay(500, 900)
 
             # Password field
             await self._type(page, "input[type='password'], input[data-testid='loginPasswordInput']", request.password)
             await self._human_delay(500, 900)
 
-            # Submit — prefer data-testid, then text match
-            submit = await page.query_selector(
-                "button[data-testid='loginSubmitButton'], button:has-text('Sign in')"
-            )
-            if submit:
-                await submit.click()
-            else:
+            # Submit — use JS click to bypass any overlay
+            submitted = await page.evaluate("""
+                () => {
+                    const submitBtn = document.querySelector("button[data-testid='loginSubmitButton'], button[type='submit']");
+                    if (submitBtn) {
+                        submitBtn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                        return true;
+                    }
+                    return false;
+                }
+            """)
+            if not submitted:
                 await page.keyboard.press("Enter")
-            await self._human_delay(4000, 6000)
+            await self._human_delay(4000, 7000)
 
             blocked, sel = await self._check_for_blocking_elements(page)
             if blocked:
@@ -327,7 +524,7 @@ class BrowserAgent:
             content = await page.content()
             # Success: redirected away from login page, or feed/home indicators present
             if ("bsky.app" in url_after and "login" not in url_after) or \
-               any(kw in content.lower() for kw in ["home", "feed", "following", "notifications"]):
+               any(kw in content.lower() for kw in ["home", "feed", "following", "notifications", "profile"]):
                 logger.info(f"[Bluesky] Login successful, URL: {url_after}")
                 return AutomationResult(status=TaskStatus.COMPLETED,
                                         result={"platform": "bluesky", "email": request.email,
@@ -337,6 +534,10 @@ class BrowserAgent:
                 return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
                                         error_message=f"Bluesky: still on sign-in page after submit: {url_after}",
                                         screenshot_path=sp)
+        except PlaywrightTimeout as e:
+            sp = await self._take_screenshot(page, task_id, "bluesky_timeout")
+            return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                    error_message=f"Bluesky: timeout (possible CAPTCHA or anti-bot): {e}", screenshot_path=sp)
         except Exception as e:
             sp = await self._take_screenshot(page, task_id, "bluesky_error")
             return AutomationResult(status=TaskStatus.FAILED,
@@ -350,18 +551,89 @@ class BrowserAgent:
         """
         logger.info("[Mastodon] Starting login flow on mastodon.social")
         try:
+            # Navigate to login page
             await page.goto("https://mastodon.social/auth/sign_in", wait_until="domcontentloaded", timeout=30000)
-            await self._human_delay(1500, 2500)
+            await self._human_delay(2000, 3000)
 
-            await self._type(page, "input#user_email, input[name='user[email]'], input[type='email']", request.email)
-            await self._human_delay(400, 700)
-            await self._type(page, "input#user_password, input[name='user[password]'], input[type='password']", request.password)
+            # Wait for form inputs to be visible
+            try:
+                await page.wait_for_selector(
+                    "input[name='user[email]'], input[type='email'], input[id='user_email']",
+                    timeout=10000, state="visible"
+                )
+            except PlaywrightTimeout:
+                # Try home page redirect
+                await page.goto("https://mastodon.social/", wait_until="domcontentloaded", timeout=30000)
+                await self._human_delay(2000, 3000)
+                # Click login link if present
+                await page.evaluate("""
+                    () => {
+                        const loginLink = Array.from(document.querySelectorAll('a')).find(el => 
+                            el.textContent.toLowerCase().includes('log in') || 
+                            el.href?.includes('auth/sign_in')
+                        );
+                        if (loginLink) loginLink.click();
+                    }
+                """)
+                await self._human_delay(2000, 3000)
+
+            # Fill email field using multiple strategies
+            email_filled = await self._type(
+                page,
+                "input[name='user[email]'], input[id='user_email'], input[type='email']",
+                request.email
+            )
+            if not email_filled:
+                await self._type(page, "input[type='text']", request.email)
             await self._human_delay(400, 700)
 
-            submit = await page.query_selector("button[type='submit'], input[type='submit'], button:has-text('Log in')")
-            if submit:
-                await submit.click()
-            await self._human_delay(3000, 5000)
+            # Fill password field
+            password_filled = await self._type(
+                page,
+                "input[name='user[password]'], input[id='user_password'], input[type='password']",
+                request.password
+            )
+            if not password_filled:
+                # Try finding password field by label
+                await page.evaluate("""
+                    () => {
+                        const inputs = document.querySelectorAll('input');
+                        for (const inp of inputs) {
+                            const label = document.querySelector(`label[for='${inp.id}']`);
+                            if (label && label.textContent.toLowerCase().includes('password')) {
+                                inp.value = arguments[0];
+                            }
+                        }
+                    }
+                """, request.password)
+            await self._human_delay(400, 700)
+
+            # Submit using JavaScript to ensure it fires
+            submitted = await page.evaluate("""
+                () => {
+                    const form = document.querySelector('form[action*="sign_in"]');
+                    const button = document.querySelector("button[type='submit'], input[type='submit']");
+                    if (form) {
+                        form.submit();
+                        return 'form';
+                    } else if (button) {
+                        button.click();
+                        return 'button';
+                    }
+                    return null;
+                }
+            """)
+            if not submitted:
+                await page.keyboard.press("Enter")
+            
+            # Wait for navigation after submission
+            await self._human_delay(4000, 6000)
+            
+            # Wait for potential redirect
+            try:
+                await page.wait_for_url(lambda url: "sign_in" not in url, timeout=5000)
+            except Exception:
+                pass  # May still be on sign_in page
 
             blocked, sel = await self._check_for_blocking_elements(page)
             if blocked:
@@ -371,15 +643,33 @@ class BrowserAgent:
 
             sp = await self._take_screenshot(page, task_id, "mastodon_done")
             url_after = page.url
-            if "sign_in" not in url_after and "mastodon.social" in url_after:
+            content = await page.content()
+            
+            # Success indicators
+            success_indicators = ["home", "timeline", "notifications", "profile", "logged_in", "logout"]
+            is_logged_in = any(ind in content.lower() for ind in success_indicators)
+            
+            if "sign_in" not in url_after and ("mastodon.social" in url_after or is_logged_in):
+                logger.info(f"[Mastodon] Login successful, URL: {url_after}")
                 return AutomationResult(status=TaskStatus.COMPLETED,
                                         result={"platform": "mastodon", "email": request.email,
                                                 "url_after": url_after},
                                         screenshot_path=sp)
             else:
+                # Check for error messages on the page
+                error_indicators = ["invalid", "incorrect", "wrong", "error", "failed"]
+                has_error = any(err in content.lower() for err in error_indicators)
+                if has_error:
+                    return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                            error_message=f"Mastodon: login failed - check credentials",
+                                            screenshot_path=sp)
                 return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
                                         error_message=f"Mastodon: unexpected URL after login: {url_after}",
                                         screenshot_path=sp)
+        except PlaywrightTimeout as e:
+            sp = await self._take_screenshot(page, task_id, "mastodon_timeout")
+            return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                    error_message=f"Mastodon: timeout (possible CAPTCHA or anti-bot): {e}", screenshot_path=sp)
         except Exception as e:
             sp = await self._take_screenshot(page, task_id, "mastodon_error")
             return AutomationResult(status=TaskStatus.FAILED,
@@ -461,37 +751,73 @@ class BrowserAgent:
         HN does not use email for login — only the username registered at signup.
         """
         logger.info("[HackerNews] Starting login flow")
-        # HN login uses the account handle (not email). The user registered as 'talderie'.
+        
+        # HN login uses the account handle (not email)
+        # Try username field first, fall back to extracting from email
         username = request.username if request.username else request.email.split("@")[0]
-        # Normalise: HN usernames are lowercase, no special chars
-        username = re.sub(r'[^a-zA-Z0-9_-]', '', username)
+        # Normalise: HN usernames are lowercase, no special chars, max 15 chars
+        username = re.sub(r'[^a-zA-Z0-9_-]', '', username).lower()[:15]
+        
+        # For testing, if credentials don't match actual HN account, note that
+        logger.info(f"[HackerNews] Using username: {username}")
+        
         try:
             await page.goto("https://news.ycombinator.com/login", wait_until="domcontentloaded", timeout=30000)
-            await self._human_delay(1000, 2000)
+            await self._human_delay(1500, 2500)
 
-            # HN login form: first table row = login section
-            # input[name='acct'] for username, input[name='pw'] for password
+            # Wait for the form to be visible
+            try:
+                await page.wait_for_selector("input[name='acct']", timeout=10000, state="visible")
+            except PlaywrightTimeout:
+                sp = await self._take_screenshot(page, task_id, "hn_no_form")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message="HackerNews: login form not found",
+                                        screenshot_path=sp)
+
+            # HN login form: input[name='acct'] for username, input[name='pw'] for password
+            # Find all inputs to avoid the create-account form
             acct_inputs = await page.query_selector_all("input[name='acct']")
-            pw_inputs   = await page.query_selector_all("input[name='pw']")
+            pw_inputs = await page.query_selector_all("input[name='pw']")
 
             # Use the FIRST acct/pw pair (login form, not create-account form)
             if acct_inputs:
-                await acct_inputs[0].click()
-                await page.keyboard.press("Control+a")
-                await acct_inputs[0].type(username, delay=random.uniform(40, 100))
+                try:
+                    await acct_inputs[0].click()
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.type(username, delay=random.uniform(40, 100))
+                except Exception:
+                    # Fallback to fill
+                    await acct_inputs[0].fill(username)
             await self._human_delay(400, 700)
 
             if pw_inputs:
-                await pw_inputs[0].click()
-                await page.keyboard.press("Control+a")
-                await pw_inputs[0].type(request.password, delay=random.uniform(40, 100))
+                try:
+                    await pw_inputs[0].click()
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.type(request.password, delay=random.uniform(40, 100))
+                except Exception:
+                    # Fallback to fill
+                    await pw_inputs[0].fill(request.password)
             await self._human_delay(400, 700)
 
-            # Click the login submit button (first input[type=submit])
+            # Click the login submit button (first input[type=submit] in the login section)
             submits = await page.query_selector_all("input[type='submit']")
             if submits:
-                await submits[0].click()
-            await self._human_delay(2000, 4000)
+                try:
+                    await submits[0].click()
+                except Exception:
+                    # Fallback to Enter key
+                    await page.keyboard.press("Enter")
+            else:
+                await page.keyboard.press("Enter")
+            
+            await self._human_delay(3000, 5000)
+
+            # Wait for potential redirect
+            try:
+                await page.wait_for_url(lambda url: "login" not in url, timeout=5000)
+            except Exception:
+                pass
 
             blocked, sel = await self._check_for_blocking_elements(page)
             if blocked:
@@ -502,14 +828,37 @@ class BrowserAgent:
             sp = await self._take_screenshot(page, task_id, "hn_done")
             url_after = page.url
             content = await page.content()
-            if "Bad login" in content or "login" in url_after:
+            
+            # Check for login errors
+            error_patterns = ["Bad login", "bad login", "Wrong", "wrong", "Invalid", "invalid", "failed"]
+            has_error = any(pattern.lower() in content.lower() for pattern in error_patterns)
+            
+            if has_error or "Bad login" in content:
+                logger.warning(f"[HackerNews] Login failed for user {username}")
                 return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
-                                        error_message="HackerNews: bad credentials or login page still shown",
+                                        error_message=f"HackerNews: bad credentials for username '{username}' (note: HN uses username not email)",
                                         screenshot_path=sp)
+            
+            if "login" in url_after:
+                # Still on login page - might be an error
+                if any(ind in content.lower() for ind in ["error", "wrong", "bad"]):
+                    return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                            error_message=f"HackerNews: login failed for username '{username}'",
+                                            screenshot_path=sp)
+                # May be waiting for something (2FA, email confirmation)
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"HackerNews: still on login page after submission: {url_after}",
+                                        screenshot_path=sp)
+            
+            logger.info(f"[HackerNews] Login successful, URL: {url_after}")
             return AutomationResult(status=TaskStatus.COMPLETED,
                                     result={"platform": "hackernews", "username": username,
                                             "url_after": url_after},
                                     screenshot_path=sp)
+        except PlaywrightTimeout as e:
+            sp = await self._take_screenshot(page, task_id, "hn_timeout")
+            return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                    error_message=f"HackerNews: timeout (possible CAPTCHA or anti-bot): {e}", screenshot_path=sp)
         except Exception as e:
             sp = await self._take_screenshot(page, task_id, "hn_error")
             return AutomationResult(status=TaskStatus.FAILED,

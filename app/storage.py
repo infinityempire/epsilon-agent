@@ -1,6 +1,7 @@
 """Asynchronous Redis storage layer for task queue management."""
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -11,6 +12,10 @@ from app.config import settings
 from app.schemas import SignupRequest, TaskStatus, TaskStatusResponse
 
 logger = logging.getLogger(__name__)
+
+# Metrics keys
+METRICS_KEY = "epsilon:metrics"
+PROCESSING_TIMES_KEY = "epsilon:processing_times"
 
 
 class Storage:
@@ -171,6 +176,248 @@ class Storage:
             "completed": await self._client.llen(settings.completed_queue_name),
         }
 
+    # -----------------------------------------------------------------------
+    # Metrics & Observability
+    # -----------------------------------------------------------------------
+    async def record_task_start(self, task_id: str) -> None:
+        """Record task processing start time for latency tracking."""
+        await self._client.hset(
+            f"{METRICS_KEY}:processing",
+            task_id,
+            str(time.time())
+        )
+
+    async def record_task_completion(self, task_id: str, status: TaskStatus) -> None:
+        """Record task completion and update metrics."""
+        # Calculate processing time
+        start_time_str = await self._client.hget(f"{METRICS_KEY}:processing", task_id)
+        if start_time_str:
+            try:
+                start_time = float(start_time_str)
+                processing_time = time.time() - start_time
+                # Store processing time for analytics
+                await self._client.lpush(PROCESSING_TIMES_KEY, processing_time)
+                # Keep only last 1000 processing times
+                await self._client.ltrim(PROCESSING_TIMES_KEY, 0, 999)
+            except Exception:
+                pass
+            # Clean up processing record
+            await self._client.hdel(f"{METRICS_KEY}:processing", task_id)
+
+        # Update status counters
+        status_key = f"{METRICS_KEY}:status:{status.value}"
+        await self._client.incr(status_key)
+        await self._client.expire(status_key, settings.task_ttl_seconds)
+
+    async def record_task_retry(self, task_id: str) -> None:
+        """Record a task retry for retry rate tracking."""
+        await self._client.hincrby(f"{METRICS_KEY}:retries", task_id, 1)
+        await self._client.expire(f"{METRICS_KEY}:retries", settings.task_ttl_seconds)
+
+    async def get_queue_stats(self) -> dict[str, Any]:
+        """Get comprehensive queue statistics including metrics."""
+        # Basic queue lengths
+        queues = await self.get_queue_length()
+        
+        # Status counters
+        status_counts = {}
+        for status in TaskStatus:
+            count = await self._client.get(f"{METRICS_KEY}:status:{status.value}")
+            status_counts[status.value] = int(count) if count else 0
+        
+        # Retry statistics
+        retry_total = 0
+        retry_data = await self._client.hgetall(f"{METRICS_KEY}:retries")
+        if retry_data:
+            retry_total = sum(int(v) for v in retry_data.values())
+        
+        # Processing time statistics
+        processing_times = []
+        raw_times = await self._client.lrange(PROCESSING_TIMES_KEY, 0, 99)
+        for t in raw_times:
+            try:
+                processing_times.append(float(t))
+            except Exception:
+                pass
+        
+        avg_processing_time = sum(processing_times) / len(processing_times) if processing_times else 0
+        min_processing_time = min(processing_times) if processing_times else 0
+        max_processing_time = max(processing_times) if processing_times else 0
+        
+        # Count active processing tasks
+        processing_count = await self._client.hlen(f"{METRICS_KEY}:processing")
+        
+        return {
+            "queues": queues,
+            "status_counts": status_counts,
+            "retry_stats": {
+                "total_retries": retry_total,
+                "tasks_with_retries": len(retry_data) if retry_data else 0,
+            },
+            "processing_stats": {
+                "active_tasks": processing_count,
+                "avg_processing_time_ms": round(avg_processing_time * 1000, 2),
+                "min_processing_time_ms": round(min_processing_time * 1000, 2),
+                "max_processing_time_ms": round(max_processing_time * 1000, 2),
+                "sample_size": len(processing_times),
+            },
+            "total_tasks": sum(status_counts.values()),
+            "success_rate": round(
+                status_counts.get("COMPLETED", 0) / max(sum(status_counts.values()), 1) * 100, 2
+            ),
+        }
+
+    async def get_task_age(self, task_id: str) -> Optional[float]:
+        """Get the age of a task in seconds since creation."""
+        task = await self.get_task(task_id)
+        if task and task.created_at:
+            return (datetime.utcnow() - task.created_at).total_seconds()
+        return None
+
+    async def cleanup_old_tasks(self, max_age_seconds: int = 86400 * 7) -> int:
+        """Remove task data older than max_age_seconds. Returns count of removed tasks."""
+        # This is a simplified cleanup - in production you'd want to scan all task keys
+        removed = 0
+        pattern = "task:*"
+        cursor = 0
+        while True:
+            cursor, keys = await self._client.scan(cursor, match=pattern, count=100)
+            for key in keys:
+                ttl = await self._client.ttl(key)
+                if ttl == -1:  # No TTL set
+                    created_at_str = await self._client.hget(key, "created_at")
+                    if created_at_str:
+                        try:
+                            created_at = datetime.fromisoformat(created_at_str)
+                            age = (datetime.utcnow() - created_at).total_seconds()
+                            if age > max_age_seconds:
+                                await self._client.delete(key)
+                                removed += 1
+                        except Exception:
+                            pass
+            if cursor == 0:
+                break
+        return removed
+
 
 # Global storage instance
 storage = Storage()
+
+
+class SessionManager:
+    """Manages browser session persistence for distributed workers."""
+
+    SESSION_PREFIX = "epsilon:session:"
+
+    def __init__(self, storage: Storage) -> None:
+        self._storage = storage
+
+    async def export_session(self, platform: str, context, metadata: Optional[dict] = None) -> str:
+        """
+        Export a browser session (cookies + storage state) to Redis.
+        
+        Args:
+            platform: Platform identifier (e.g., 'bluesky', 'mastodon')
+            context: Playwright BrowserContext to export from
+            metadata: Optional metadata about the session
+            
+        Returns:
+            Session ID that can be used to import the session later
+        """
+        import uuid
+        session_id = str(uuid.uuid4())
+        
+        # Get cookies from context
+        cookies = await context.cookies()
+        
+        # Get localStorage/sessionStorage via JavaScript
+        storage_state = await context.storage_state()
+        
+        session_data = {
+            "session_id": session_id,
+            "platform": platform,
+            "cookies": cookies,
+            "origins": storage_state.get("cookies", []),
+            "local_storage": storage_state.get("localStorage", []),
+            "session_storage": storage_state.get("sessionStorage", []),
+            "metadata": metadata or {},
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        
+        # Store in Redis with TTL
+        key = f"{self.SESSION_PREFIX}{platform}:{session_id}"
+        await self._storage._client.set(
+            key,
+            json.dumps(session_data),
+            ex=settings.task_ttl_seconds * 7  # Keep sessions longer than tasks
+        )
+        
+        logger.info(f"Exported session {session_id} for platform {platform}")
+        return session_id
+
+    async def import_session(self, platform: str, session_id: str, context) -> bool:
+        """
+        Import a browser session from Redis into a Playwright context.
+        
+        Args:
+            platform: Platform identifier
+            session_id: Session ID returned from export_session
+            context: Playwright BrowserContext to import into
+            
+        Returns:
+            True if session was imported successfully
+        """
+        key = f"{self.SESSION_PREFIX}{platform}:{session_id}"
+        session_data_str = await self._storage._client.get(key)
+        
+        if not session_data_str:
+            logger.warning(f"Session {session_id} not found for platform {platform}")
+            return False
+        
+        try:
+            session_data = json.loads(session_data_str)
+            
+            # Add cookies to context
+            cookies = session_data.get("cookies", [])
+            if cookies:
+                await context.add_cookies(cookies)
+            
+            logger.info(f"Imported session {session_id} for platform {platform}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to import session {session_id}: {e}")
+            return False
+
+    async def get_session(self, platform: str, session_id: str) -> Optional[dict]:
+        """Get session metadata without importing."""
+        key = f"{self.SESSION_PREFIX}{platform}:{session_id}"
+        data = await self._storage._client.get(key)
+        if data:
+            return json.loads(data)
+        return None
+
+    async def list_sessions(self, platform: Optional[str] = None) -> list[dict]:
+        """List all sessions, optionally filtered by platform."""
+        pattern = f"{self.SESSION_PREFIX}{platform or '*'}:*"
+        sessions = []
+        cursor = 0
+        while True:
+            cursor, keys = await self._storage._client.scan(cursor, match=pattern, count=100)
+            for key in keys:
+                data = await self._storage._client.get(key)
+                if data:
+                    sessions.append(json.loads(data))
+            if cursor == 0:
+                break
+        return sessions
+
+    async def delete_session(self, platform: str, session_id: str) -> bool:
+        """Delete a session from storage."""
+        key = f"{self.SESSION_PREFIX}{platform}:{session_id}"
+        result = await self._storage._client.delete(key)
+        return result > 0
+
+
+# Global session manager instance
+session_manager = SessionManager(storage)

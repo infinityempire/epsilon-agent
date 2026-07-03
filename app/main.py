@@ -17,7 +17,7 @@ from app.schemas import (
     TaskStatus,
     TaskStatusResponse,
 )
-from app.storage import storage
+from app.storage import storage, session_manager
 
 # Configure logging
 logging.basicConfig(
@@ -136,14 +136,10 @@ async def create_signup_task(request: SignupRequest) -> SignupResponse:
 
 @app.get("/queue/stats", tags=["Queue"])
 async def get_queue_stats() -> dict:
-    """Get statistics about the task queues."""
-    stats = await storage.get_queue_length()
+    """Get comprehensive statistics about the task queues and metrics."""
+    stats = await storage.get_queue_stats()
     return {
-        "queues": {
-            "pending": stats["pending"],
-            "in_progress": stats["in_progress"],
-            "completed": stats["completed"],
-        },
+        **stats,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -155,6 +151,47 @@ async def http_exception_handler(request, exc: HTTPException):
         status_code=exc.status_code,
         content=exc.detail,
     )
+
+
+# Session Management Endpoints
+@app.get("/sessions", tags=["Sessions"])
+async def list_sessions(platform: str | None = None) -> dict:
+    """List all stored sessions, optionally filtered by platform."""
+    sessions = await session_manager.list_sessions(platform)
+    return {
+        "sessions": sessions,
+        "count": len(sessions),
+    }
+
+
+@app.get("/sessions/{platform}/{session_id}", tags=["Sessions"])
+async def get_session(platform: str, session_id: str) -> dict:
+    """Get session details by platform and session ID."""
+    session = await session_manager.get_session(platform, session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ErrorResponse(
+                error="NotFound",
+                message=f"Session {session_id} not found for platform {platform}",
+            ).model_dump(),
+        )
+    return session
+
+
+@app.delete("/sessions/{platform}/{session_id}", tags=["Sessions"])
+async def delete_session(platform: str, session_id: str) -> dict:
+    """Delete a stored session."""
+    deleted = await session_manager.delete_session(platform, session_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ErrorResponse(
+                error="NotFound",
+                message=f"Session {session_id} not found for platform {platform}",
+            ).model_dump(),
+        )
+    return {"deleted": True, "platform": platform, "session_id": session_id}
 
 
 if __name__ == "__main__":

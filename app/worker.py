@@ -79,6 +79,9 @@ class Worker:
                 logger.error(f"Task {task_id} not found")
                 return False
             
+            # Record task start for metrics
+            await storage.record_task_start(task_id)
+            
             # Update status to IN_PROGRESS
             await storage.update_task_status(task_id, TaskStatus.IN_PROGRESS)
             
@@ -93,7 +96,15 @@ class Worker:
             if self._browser_agent is None:
                 raise RuntimeError("Browser agent not initialized")
             
-            result = await self._browser_agent.execute_signup(task_id, signup_request)
+            result = await self._browser_agent.execute_signup(
+                task_id,
+                signup_request,
+                session_id=signup_request.session_id,
+                export_session=signup_request.export_session,
+            )
+            
+            # Record task completion metrics
+            await storage.record_task_completion(task_id, result.status)
             
             # Update task with result
             await storage.update_task_status(
@@ -118,8 +129,12 @@ class Worker:
         except Exception as e:
             logger.exception(f"Error processing task {task_id}: {e}")
             
+            # Record failure metric
+            await storage.record_task_completion(task_id, TaskStatus.FAILED)
+            
             # Check retry count
             retry_count = await storage.increment_retry_count(task_id)
+            await storage.record_task_retry(task_id)
             
             if retry_count >= settings.max_retries:
                 await storage.update_task_status(
