@@ -6,6 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from playwright.async_api import (
     BrowserContext,
@@ -47,6 +48,17 @@ BOT_DETECTION_SELECTORS = [
     "iframe[src*='challenge']",
 ]
 
+# ---------------------------------------------------------------------------
+# Platform registry: maps hostname → handler method name
+# ---------------------------------------------------------------------------
+PLATFORM_HANDLERS = {
+    "bsky.app":              "_handle_bluesky",
+    "joinmastodon.org":      "_handle_mastodon",
+    "join-lemmy.org":        "_handle_lemmy",
+    "news.ycombinator.com":  "_handle_hackernews",
+    "discord.com":           "_handle_discord",
+}
+
 
 @dataclass
 class AutomationResult:
@@ -59,68 +71,38 @@ class AutomationResult:
 
 
 class InboxService:
-    """
-    Abstract inbox service for receiving confirmation codes.
-    This is a stub implementation that simulates OTP/code receipt.
-    """
+    """Abstract inbox service for receiving confirmation codes (stub)."""
 
     async def get_verification_code(self, email: str, timeout_seconds: int = 60) -> Optional[str]:
-        """
-        Wait for and retrieve a verification code from the inbox.
-        
-        In a real implementation, this would:
-        - Connect to an email provider API (Gmail, SendGrid, etc.)
-        - Poll for new emails to the target address
-        - Extract the verification code from the email body
-        
-        For this MVP, we simulate receiving a code after a delay.
-        """
         logger.info(f"Waiting for verification code for {email}")
-        
-        # Simulate network delay for email delivery
         await asyncio.sleep(random.uniform(2, 5))
-        
-        # Generate a simulated 6-digit code
         simulated_code = str(random.randint(100000, 999999))
         logger.info(f"Simulated verification code received: {simulated_code}")
-        
         return simulated_code
 
     async def setup_inbox(self, email: str) -> bool:
-        """
-        Set up an inbox for the given email address.
-        Returns True if setup was successful.
-        """
         logger.info(f"Setting up inbox for {email}")
-        # In real implementation, this would create/register the email address
         return True
 
     async def cleanup_inbox(self, email: str) -> None:
-        """Clean up the inbox after use."""
         logger.info(f"Cleaning up inbox for {email}")
 
 
 class BrowserAgent:
-    """
-    Async browser automation agent for account creation.
-    Uses Playwright to control a headless browser.
-    """
+    """Async browser automation agent for account creation."""
 
     def __init__(self) -> None:
-        """Initialize the browser agent."""
         self._playwright: Optional[Playwright] = None
         self._browser_type: Optional[BrowserType] = None
         self._inbox_service = InboxService()
         self._context: Optional[BrowserContext] = None
 
     async def initialize(self) -> None:
-        """Initialize Playwright and browser."""
         if self._playwright is None:
             self._playwright = await async_playwright().start()
             self._browser_type = self._playwright.chromium
 
     async def cleanup(self) -> None:
-        """Clean up Playwright resources."""
         if self._context:
             await self._context.close()
             self._context = None
@@ -129,7 +111,6 @@ class BrowserAgent:
             self._playwright = None
 
     async def _ensure_context(self) -> BrowserContext:
-        """Ensure a fresh browser context exists."""
         if self._context is None:
             browser = await self._browser_type.launch(
                 headless=settings.headless,
@@ -139,13 +120,11 @@ class BrowserAgent:
                     "--no-sandbox",
                 ],
             )
-            # Each task gets an isolated context
             self._context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
+                viewport={"width": 1280, "height": 800},
                 user_agent=self._get_realistic_user_agent(),
                 locale="en-US",
             )
-            # Set realistic browser properties
             await self._context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
@@ -153,13 +132,14 @@ class BrowserAgent:
         return self._context
 
     def _get_realistic_user_agent(self) -> str:
-        """Generate a realistic user agent string."""
         chrome_versions = ["120.0.0.0", "121.0.0.0", "122.0.0.0"]
-        base = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{random.choice(chrome_versions)} Safari/537.36"
-        return base
+        return (
+            f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{random.choice(chrome_versions)} Safari/537.36"
+        )
 
     async def _check_for_blocking_elements(self, page: Page) -> tuple[bool, str]:
-        """Check if page contains CAPTCHA or bot detection elements."""
         for selector in CAPTCHA_SELECTORS + BOT_DETECTION_SELECTORS:
             try:
                 element = await page.query_selector(selector)
@@ -170,8 +150,7 @@ class BrowserAgent:
                 continue
         return False, ""
 
-    async def _take_screenshot(self, page: Page, task_id: str, prefix: str = "error") -> str:
-        """Take a screenshot and save to disk."""
+    async def _take_screenshot(self, page: Page, task_id: str, prefix: str = "result") -> str:
         settings.ensure_screenshot_dir()
         timestamp = int(time.time())
         filename = f"{prefix}_{task_id}_{timestamp}.png"
@@ -180,123 +159,81 @@ class BrowserAgent:
         logger.info(f"Screenshot saved to {filepath}")
         return str(filepath)
 
-    async def _human_delay(self, min_ms: int = 500, max_ms: int = 2000) -> None:
-        """Simulate human-like delays between actions."""
-        delay = random.uniform(min_ms, max_ms) / 1000
-        await asyncio.sleep(delay)
+    async def _human_delay(self, min_ms: int = 400, max_ms: int = 1200) -> None:
+        await asyncio.sleep(random.uniform(min_ms, max_ms) / 1000)
 
+    async def _type(self, page: Page, selector: str, value: str) -> bool:
+        """Fill a field identified by selector; returns True on success."""
+        # Try each comma-separated selector individually
+        for sel in [s.strip() for s in selector.split(",")]:
+            try:
+                el = await page.wait_for_selector(sel, timeout=4000, state="visible")
+                if el:
+                    # Use fill() first (works with React controlled inputs)
+                    try:
+                        await el.fill(value)
+                        return True
+                    except Exception:
+                        pass
+                    # Fallback: click + type
+                    try:
+                        await el.click()
+                        await page.keyboard.press("Control+a")
+                        await el.type(value, delay=random.uniform(40, 80))
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return False
+
+    # -----------------------------------------------------------------------
+    # Public entry point
+    # -----------------------------------------------------------------------
     async def execute_signup(self, task_id: str, request: SignupRequest) -> AutomationResult:
-        """
-        Execute the account signup workflow.
-        
-        Args:
-            task_id: Unique identifier for this task
-            request: Signup request data
-            
-        Returns:
-            AutomationResult with status and any result/error data
-        """
         page: Optional[Page] = None
-        
         try:
-            # Initialize if needed
             await self.initialize()
-            
-            # Set up inbox
             await self._inbox_service.setup_inbox(request.email)
-            
-            # Create isolated browser context
             context = await self._ensure_context()
             page = await context.new_page()
-            
-            # Navigate to signup page
+
             target_url = str(request.target_url) if request.target_url else settings.mock_target_url
-            logger.info(f"Navigating to {target_url}")
-            
-            try:
-                await page.goto(
-                    target_url,
-                    timeout=settings.navigation_timeout_ms,
-                    wait_until="domcontentloaded",
-                )
-            except PlaywrightTimeout:
-                return AutomationResult(
-                    status=TaskStatus.FAILED,
-                    error_message=f"Navigation timeout to {target_url}",
-                )
-            
-            await self._human_delay(1000, 3000)
-            
-            # Check for blocking elements after navigation
-            blocked, selector = await self._check_for_blocking_elements(page)
-            if blocked:
-                screenshot_path = await self._take_screenshot(page, task_id, "blocked")
-                await self._inbox_service.cleanup_inbox(request.email)
-                return AutomationResult(
-                    status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
-                    error_message=f"CAPTCHA or blocking element detected: {selector}",
-                    screenshot_path=screenshot_path,
-                )
-            
-            # Fill signup form fields
-            signup_result = await self._fill_signup_form(page, request)
-            if signup_result is not None:
-                return signup_result
-            
-            # Submit form
-            await self._human_delay(500, 1500)
-            
-            try:
-                submit_button = await page.query_selector(
-                    "button[type='submit'], input[type='submit'], button:has-text('Sign up'), button:has-text('Create'), button:has-text('Register')"
-                )
-                if submit_button:
-                    await submit_button.click()
-                    await self._human_delay(2000, 5000)
-                else:
-                    logger.warning("No submit button found, form may auto-submit")
-            except Exception as e:
-                logger.error(f"Error clicking submit: {e}")
-            
-            # Check for blocking elements after submission
-            blocked, selector = await self._check_for_blocking_elements(page)
-            if blocked:
-                screenshot_path = await self._take_screenshot(page, task_id, "blocked_post_submit")
-                await self._inbox_service.cleanup_inbox(request.email)
-                return AutomationResult(
-                    status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
-                    error_message=f"CAPTCHA/bot detection appeared after submission: {selector}",
-                    screenshot_path=screenshot_path,
-                )
-            
-            # Wait for email verification step
-            verification_result = await self._handle_verification(page, request)
-            if verification_result is not None:
-                await self._inbox_service.cleanup_inbox(request.email)
-                return verification_result
-            
-            # Success - account created
+            hostname = urlparse(target_url).hostname or ""
+
+            # Resolve platform-specific handler
+            handler_name = None
+            for domain, hname in PLATFORM_HANDLERS.items():
+                if domain in hostname:
+                    handler_name = hname
+                    break
+
+            if handler_name:
+                handler = getattr(self, handler_name)
+                result = await handler(page, task_id, request)
+            else:
+                # Fallback: generic flow
+                result = await self._generic_signup(page, task_id, request, target_url)
+
             await self._inbox_service.cleanup_inbox(request.email)
-            return AutomationResult(
-                status=TaskStatus.COMPLETED,
-                result={
-                    "email": request.email,
-                    "username": request.username,
-                    "message": "Account created successfully",
-                },
-            )
-            
+            return result
+
         except PlaywrightTimeout as e:
-            screenshot_path = await self._take_screenshot(page, task_id, "timeout") if page else None
+            try:
+                screenshot_path = await self._take_screenshot(page, task_id, "timeout") if page else None
+            except Exception:
+                screenshot_path = None
             await self._inbox_service.cleanup_inbox(request.email)
             return AutomationResult(
                 status=TaskStatus.FAILED,
                 error_message=f"Browser operation timed out: {str(e)}",
                 screenshot_path=screenshot_path,
             )
-            
         except Exception as e:
-            screenshot_path = await self._take_screenshot(page, task_id, "exception") if page else None
+            try:
+                screenshot_path = await self._take_screenshot(page, task_id, "exception") if page else None
+            except Exception:
+                screenshot_path = None
             await self._inbox_service.cleanup_inbox(request.email)
             logger.exception(f"Unexpected error during signup: {e}")
             return AutomationResult(
@@ -304,186 +241,460 @@ class BrowserAgent:
                 error_message=f"Unexpected error: {str(e)}",
                 screenshot_path=screenshot_path,
             )
-            
         finally:
             if page:
                 await page.close()
 
-    async def _fill_signup_form(self, page: Page, request: SignupRequest) -> Optional[AutomationResult]:
+    # -----------------------------------------------------------------------
+    # Platform handlers
+    # -----------------------------------------------------------------------
+
+    # --- Bluesky -----------------------------------------------------------
+    async def _handle_bluesky(self, page: Page, task_id: str, request: SignupRequest) -> AutomationResult:
         """
-        Fill in the signup form fields.
-        Returns None on success, or an AutomationResult if we need to abort.
+        Bluesky login via https://bsky.app
+        Flow: navigate → wait for SPA → fill identifier + password → click Sign in
+        The sign-in form is a React SPA; we wait for the input to appear.
         """
-        task_id = "unknown"  # Will be set by caller
-        
-        # Common field selectors for signup forms
-        field_mappings = {
-            "email": [
-                "input[name='email']",
-                "input[name='emailAddress']",
-                "input[id='email']",
-                "input[type='email']",
-                "input[placeholder*='email']",
-                "input[placeholder*='Email']",
-            ],
-            "username": [
-                "input[name='username']",
-                "input[name='user']",
-                "input[id='username']",
-                "input[placeholder*='username']",
-                "input[placeholder*='Username']",
-                "input[placeholder*='user name']",
-            ],
-            "password": [
-                "input[name='password']",
-                "input[name='pwd']",
-                "input[id='password']",
-                "input[type='password']",
-                "input[placeholder*='password']",
-                "input[placeholder*='Password']",
-            ],
-            "confirm_password": [
-                "input[name='confirmPassword']",
-                "input[name='confirm_password']",
-                "input[name='passwordConfirm']",
-                "input[id='confirmPassword']",
-                "input[placeholder*='confirm']",
-            ],
-        }
-        
-        async def fill_field(field_type: str, value: str) -> bool:
-            """Try to fill a field using various selectors."""
-            selectors = field_mappings.get(field_type, [])
-            for selector in selectors:
+        logger.info("[Bluesky] Starting login flow")
+        try:
+            await page.goto("https://bsky.app", wait_until="domcontentloaded", timeout=30000)
+            await self._human_delay(2000, 3000)
+
+            # Bluesky shows a welcome modal with a 'Sign in' link.
+            # The modal has aria-modal=true and intercepts pointer events.
+            # We use dispatchEvent to bypass pointer-event blocking.
+            try:
+                await page.wait_for_selector(
+                    "a:has-text('Sign in'), button:has-text('Sign in')",
+                    timeout=10000
+                )
+                await page.evaluate("""
+                    () => {
+                        const all = Array.from(document.querySelectorAll('a, button'));
+                        const si = all.find(el => el.textContent.trim() === 'Sign in');
+                        if (si) {
+                            si.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                        }
+                    }
+                """)
+                await self._human_delay(2000, 3000)
+            except Exception:
+                pass  # Already on form
+
+            # Wait for the identifier input to appear (SPA may need time)
+            try:
+                await page.wait_for_selector(
+                    "input[data-testid='loginUsernameInput'], input[placeholder*='username' i], input[placeholder*='handle' i], input[autocomplete='username']",
+                    timeout=10000, state="visible"
+                )
+            except Exception:
+                pass
+
+            # Identifier field
+            filled_id = await self._type(
+                page,
+                "input[data-testid='loginUsernameInput'], input[placeholder*='username' i], input[placeholder*='handle' i], input[autocomplete='username']",
+                request.email
+            )
+            if not filled_id:
+                # Try generic text input
+                await self._type(page, "input[type='text']:visible", request.email)
+            await self._human_delay(500, 900)
+
+            # Password field
+            await self._type(page, "input[type='password'], input[data-testid='loginPasswordInput']", request.password)
+            await self._human_delay(500, 900)
+
+            # Submit — prefer data-testid, then text match
+            submit = await page.query_selector(
+                "button[data-testid='loginSubmitButton'], button:has-text('Sign in')"
+            )
+            if submit:
+                await submit.click()
+            else:
+                await page.keyboard.press("Enter")
+            await self._human_delay(4000, 6000)
+
+            blocked, sel = await self._check_for_blocking_elements(page)
+            if blocked:
+                sp = await self._take_screenshot(page, task_id, "bluesky_blocked")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Bluesky: blocking element {sel}", screenshot_path=sp)
+
+            sp = await self._take_screenshot(page, task_id, "bluesky_done")
+            url_after = page.url
+            content = await page.content()
+            # Success: redirected away from login page, or feed/home indicators present
+            if ("bsky.app" in url_after and "login" not in url_after) or \
+               any(kw in content.lower() for kw in ["home", "feed", "following", "notifications"]):
+                logger.info(f"[Bluesky] Login successful, URL: {url_after}")
+                return AutomationResult(status=TaskStatus.COMPLETED,
+                                        result={"platform": "bluesky", "email": request.email,
+                                                "url_after": url_after},
+                                        screenshot_path=sp)
+            else:
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Bluesky: still on sign-in page after submit: {url_after}",
+                                        screenshot_path=sp)
+        except Exception as e:
+            sp = await self._take_screenshot(page, task_id, "bluesky_error")
+            return AutomationResult(status=TaskStatus.FAILED,
+                                    error_message=f"Bluesky error: {e}", screenshot_path=sp)
+
+    # --- Mastodon ----------------------------------------------------------
+    async def _handle_mastodon(self, page: Page, task_id: str, request: SignupRequest) -> AutomationResult:
+        """
+        Mastodon: joinmastodon.org is a directory page.
+        We attempt login on mastodon.social (the flagship instance).
+        """
+        logger.info("[Mastodon] Starting login flow on mastodon.social")
+        try:
+            await page.goto("https://mastodon.social/auth/sign_in", wait_until="domcontentloaded", timeout=30000)
+            await self._human_delay(1500, 2500)
+
+            await self._type(page, "input#user_email, input[name='user[email]'], input[type='email']", request.email)
+            await self._human_delay(400, 700)
+            await self._type(page, "input#user_password, input[name='user[password]'], input[type='password']", request.password)
+            await self._human_delay(400, 700)
+
+            submit = await page.query_selector("button[type='submit'], input[type='submit'], button:has-text('Log in')")
+            if submit:
+                await submit.click()
+            await self._human_delay(3000, 5000)
+
+            blocked, sel = await self._check_for_blocking_elements(page)
+            if blocked:
+                sp = await self._take_screenshot(page, task_id, "mastodon_blocked")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Mastodon: blocking element {sel}", screenshot_path=sp)
+
+            sp = await self._take_screenshot(page, task_id, "mastodon_done")
+            url_after = page.url
+            if "sign_in" not in url_after and "mastodon.social" in url_after:
+                return AutomationResult(status=TaskStatus.COMPLETED,
+                                        result={"platform": "mastodon", "email": request.email,
+                                                "url_after": url_after},
+                                        screenshot_path=sp)
+            else:
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Mastodon: unexpected URL after login: {url_after}",
+                                        screenshot_path=sp)
+        except Exception as e:
+            sp = await self._take_screenshot(page, task_id, "mastodon_error")
+            return AutomationResult(status=TaskStatus.FAILED,
+                                    error_message=f"Mastodon error: {e}", screenshot_path=sp)
+
+    # --- Lemmy -------------------------------------------------------------
+    async def _handle_lemmy(self, page: Page, task_id: str, request: SignupRequest) -> AutomationResult:
+        """
+        Lemmy: join-lemmy.org is a directory. We login on lemmy.world (largest instance).
+        The login form has 'Email or Username' and 'Password' inputs plus a 'Login' button.
+        """
+        logger.info("[Lemmy] Starting login flow on lemmy.world")
+        try:
+            await page.goto("https://lemmy.world/login", wait_until="networkidle", timeout=30000)
+            await self._human_delay(1500, 2500)
+
+            # Fill email/username — use fill() directly on the first visible text input
+            inputs = await page.query_selector_all("input[type='text'], input[type='email'], input:not([type='password'])")
+            filled_user = False
+            for inp in inputs:
                 try:
-                    element = await page.query_selector(selector)
-                    if element and await element.is_visible():
-                        await element.fill("")
-                        await element.type(value, delay=random.uniform(50, 150))
-                        logger.info(f"Filled {field_type} field")
-                        return True
+                    if await inp.is_visible():
+                        await inp.click()
+                        await page.keyboard.press("Control+a")
+                        await inp.type(request.email, delay=random.uniform(40, 100))
+                        filled_user = True
+                        break
                 except Exception:
                     continue
-            return False
-        
-        # Fill email
-        if not await fill_field("email", request.email):
-            logger.warning("Could not find email field")
-            
-        await self._human_delay(300, 800)
-        
-        # Fill username
-        if not await fill_field("username", request.username):
-            logger.warning("Could not find username field")
-            
-        await self._human_delay(300, 800)
-        
-        # Fill password
-        if not await fill_field("password", request.password):
-            logger.warning("Could not find password field")
-            
-        await self._human_delay(300, 800)
-        
-        # Fill confirm password if field exists
-        confirm_selectors = field_mappings["confirm_password"]
-        for selector in confirm_selectors:
-            try:
-                element = await page.query_selector(selector)
-                if element and await element.is_visible():
-                    await element.fill("")
-                    await element.type(request.password, delay=random.uniform(50, 150))
-                    logger.info("Filled confirm password field")
-                    break
-            except Exception:
-                continue
-        
-        return None
+            if not filled_user:
+                await self._type(page, "input", request.email)
+            await self._human_delay(400, 700)
 
-    async def _handle_verification(
-        self, page: Page, request: SignupRequest
-    ) -> Optional[AutomationResult]:
+            # Password
+            await self._type(page, "input[type='password']", request.password)
+            await self._human_delay(400, 700)
+
+            # Click the Login button using JavaScript to bypass visibility issues
+            clicked = await page.evaluate("""
+                () => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const login = btns.find(b => b.textContent.trim().toLowerCase() === 'login');
+                    if (login) { login.click(); return true; }
+                    return false;
+                }
+            """)
+            if not clicked:
+                await page.keyboard.press("Enter")
+            await self._human_delay(3000, 5000)
+
+            blocked, sel = await self._check_for_blocking_elements(page)
+            if blocked:
+                sp = await self._take_screenshot(page, task_id, "lemmy_blocked")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Lemmy: blocking element {sel}", screenshot_path=sp)
+
+            sp = await self._take_screenshot(page, task_id, "lemmy_done")
+            url_after = page.url
+            content = await page.content()
+            if "login" not in url_after or any(kw in content.lower() for kw in ["profile", "inbox", "logout"]):
+                return AutomationResult(status=TaskStatus.COMPLETED,
+                                        result={"platform": "lemmy", "email": request.email,
+                                                "url_after": url_after},
+                                        screenshot_path=sp)
+            else:
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Lemmy: still on login page: {url_after}",
+                                        screenshot_path=sp)
+        except Exception as e:
+            sp = await self._take_screenshot(page, task_id, "lemmy_error")
+            return AutomationResult(status=TaskStatus.FAILED,
+                                    error_message=f"Lemmy error: {e}", screenshot_path=sp)
+
+    # --- Hacker News -------------------------------------------------------
+    async def _handle_hackernews(self, page: Page, task_id: str, request: SignupRequest) -> AutomationResult:
         """
-        Handle email verification step if required.
-        Returns None to continue, or an AutomationResult to abort.
+        Hacker News login via https://news.ycombinator.com/login
+        Fields: acct (username, NOT email), pw (password)
+        HN does not use email for login — only the username registered at signup.
         """
-        # Look for verification code input
+        logger.info("[HackerNews] Starting login flow")
+        # HN login uses the account handle (not email). The user registered as 'talderie'.
+        username = request.username if request.username else request.email.split("@")[0]
+        # Normalise: HN usernames are lowercase, no special chars
+        username = re.sub(r'[^a-zA-Z0-9_-]', '', username)
+        try:
+            await page.goto("https://news.ycombinator.com/login", wait_until="domcontentloaded", timeout=30000)
+            await self._human_delay(1000, 2000)
+
+            # HN login form: first table row = login section
+            # input[name='acct'] for username, input[name='pw'] for password
+            acct_inputs = await page.query_selector_all("input[name='acct']")
+            pw_inputs   = await page.query_selector_all("input[name='pw']")
+
+            # Use the FIRST acct/pw pair (login form, not create-account form)
+            if acct_inputs:
+                await acct_inputs[0].click()
+                await page.keyboard.press("Control+a")
+                await acct_inputs[0].type(username, delay=random.uniform(40, 100))
+            await self._human_delay(400, 700)
+
+            if pw_inputs:
+                await pw_inputs[0].click()
+                await page.keyboard.press("Control+a")
+                await pw_inputs[0].type(request.password, delay=random.uniform(40, 100))
+            await self._human_delay(400, 700)
+
+            # Click the login submit button (first input[type=submit])
+            submits = await page.query_selector_all("input[type='submit']")
+            if submits:
+                await submits[0].click()
+            await self._human_delay(2000, 4000)
+
+            blocked, sel = await self._check_for_blocking_elements(page)
+            if blocked:
+                sp = await self._take_screenshot(page, task_id, "hn_blocked")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"HN: blocking element {sel}", screenshot_path=sp)
+
+            sp = await self._take_screenshot(page, task_id, "hn_done")
+            url_after = page.url
+            content = await page.content()
+            if "Bad login" in content or "login" in url_after:
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message="HackerNews: bad credentials or login page still shown",
+                                        screenshot_path=sp)
+            return AutomationResult(status=TaskStatus.COMPLETED,
+                                    result={"platform": "hackernews", "username": username,
+                                            "url_after": url_after},
+                                    screenshot_path=sp)
+        except Exception as e:
+            sp = await self._take_screenshot(page, task_id, "hn_error")
+            return AutomationResult(status=TaskStatus.FAILED,
+                                    error_message=f"HackerNews error: {e}", screenshot_path=sp)
+
+    # --- Discord -----------------------------------------------------------
+    async def _handle_discord(self, page: Page, task_id: str, request: SignupRequest) -> AutomationResult:
+        """
+        Discord login via https://discord.com/login
+        Discord's React SPA uses dynamic class names; we target by aria-label.
+        Fields: 'Email or Phone Number' (aria-label), 'Password' (aria-label)
+        """
+        logger.info("[Discord] Starting login flow")
+        try:
+            await page.goto("https://discord.com/login", wait_until="domcontentloaded", timeout=30000)
+            await self._human_delay(2500, 4000)
+
+            # Wait for the email input to appear
+            try:
+                await page.wait_for_selector(
+                    "input[aria-label='Email or Phone Number'], input[name='email'], input[type='email']",
+                    timeout=12000, state="visible"
+                )
+            except Exception:
+                pass
+
+            # Fill email
+            filled = await self._type(
+                page,
+                "input[aria-label='Email or Phone Number'], input[name='email'], input[type='email']",
+                request.email
+            )
+            if not filled:
+                # Fallback: first visible text input
+                inputs = await page.query_selector_all("input:not([type='password'])")
+                for inp in inputs:
+                    if await inp.is_visible():
+                        await inp.click()
+                        await page.keyboard.press("Control+a")
+                        await inp.type(request.email, delay=random.uniform(40, 100))
+                        break
+            await self._human_delay(600, 1000)
+
+            # Fill password
+            await self._type(
+                page,
+                "input[aria-label='Password'], input[type='password'], input[name='password']",
+                request.password
+            )
+            await self._human_delay(600, 1000)
+
+            # Click Log In button
+            clicked = await page.evaluate("""
+                () => {
+                    const btns = Array.from(document.querySelectorAll('button[type="submit"]'));
+                    if (btns.length > 0) { btns[0].click(); return true; }
+                    const all = Array.from(document.querySelectorAll('button'));
+                    const li = all.find(b => /log.?in/i.test(b.textContent));
+                    if (li) { li.click(); return true; }
+                    return false;
+                }
+            """)
+            if not clicked:
+                await page.keyboard.press("Enter")
+            await self._human_delay(5000, 8000)
+
+            blocked, sel = await self._check_for_blocking_elements(page)
+            if blocked:
+                sp = await self._take_screenshot(page, task_id, "discord_blocked")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Discord: blocking element {sel}", screenshot_path=sp)
+
+            sp = await self._take_screenshot(page, task_id, "discord_done")
+            url_after = page.url
+            content = await page.content()
+            # Discord redirects to /channels/@me on success
+            if "channels" in url_after or "@me" in url_after:
+                return AutomationResult(status=TaskStatus.COMPLETED,
+                                        result={"platform": "discord", "email": request.email,
+                                                "url_after": url_after},
+                                        screenshot_path=sp)
+            elif "login" in url_after:
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Discord: still on login page — possible CAPTCHA or bad credentials",
+                                        screenshot_path=sp)
+            else:
+                # Intermediate state (e.g., 2FA prompt)
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"Discord: intermediate state after login: {url_after}",
+                                        screenshot_path=sp)
+        except PlaywrightTimeout as e:
+            try:
+                sp = await self._take_screenshot(page, task_id, "discord_timeout")
+            except Exception:
+                sp = None
+            return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                    error_message=f"Discord: timeout (likely CAPTCHA/anti-bot): {e}",
+                                    screenshot_path=sp)
+        except Exception as e:
+            try:
+                sp = await self._take_screenshot(page, task_id, "discord_error")
+            except Exception:
+                sp = None
+            return AutomationResult(status=TaskStatus.FAILED,
+                                    error_message=f"Discord error: {e}", screenshot_path=sp)
+
+    # -----------------------------------------------------------------------
+    # Generic fallback
+    # -----------------------------------------------------------------------
+    async def _generic_signup(self, page: Page, task_id: str, request: SignupRequest, target_url: str) -> AutomationResult:
+        try:
+            await page.goto(target_url, timeout=settings.navigation_timeout_ms, wait_until="domcontentloaded")
+            await self._human_delay(1000, 3000)
+            blocked, sel = await self._check_for_blocking_elements(page)
+            if blocked:
+                sp = await self._take_screenshot(page, task_id, "blocked")
+                return AutomationResult(status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
+                                        error_message=f"CAPTCHA/block detected: {sel}", screenshot_path=sp)
+            await self._fill_signup_form(page, request)
+            await self._human_delay(500, 1500)
+            submit = await page.query_selector(
+                "button[type='submit'], input[type='submit'], button:has-text('Sign up'), button:has-text('Create'), button:has-text('Register')"
+            )
+            if submit:
+                await submit.click()
+                await self._human_delay(2000, 5000)
+            sp = await self._take_screenshot(page, task_id, "generic_done")
+            return AutomationResult(status=TaskStatus.COMPLETED,
+                                    result={"email": request.email, "username": request.username},
+                                    screenshot_path=sp)
+        except Exception as e:
+            sp = await self._take_screenshot(page, task_id, "generic_error")
+            return AutomationResult(status=TaskStatus.FAILED,
+                                    error_message=f"Generic error: {e}", screenshot_path=sp)
+
+    async def _fill_signup_form(self, page: Page, request: SignupRequest) -> None:
+        field_mappings = {
+            "email": ["input[name='email']", "input[id='email']", "input[type='email']", "input[placeholder*='email' i]"],
+            "username": ["input[name='username']", "input[id='username']", "input[placeholder*='username' i]"],
+            "password": ["input[name='password']", "input[id='password']", "input[type='password']"],
+            "confirm_password": ["input[name='confirmPassword']", "input[name='confirm_password']", "input[name='passwordConfirm']", "input[placeholder*='confirm' i]"],
+        }
+        for field, selectors in field_mappings.items():
+            value = request.email if field == "email" else (request.username if field == "username" else request.password)
+            for sel in selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el and await el.is_visible():
+                        await el.fill("")
+                        await el.type(value, delay=random.uniform(50, 120))
+                        await self._human_delay(300, 700)
+                        break
+                except Exception:
+                    continue
+
+    async def _handle_verification(self, page: Page, request: SignupRequest) -> Optional[AutomationResult]:
         verification_selectors = [
-            "input[name='code']",
-            "input[name='verificationCode']",
-            "input[name='otp']",
-            "input[id='verification-code']",
-            "input[placeholder*='code']",
-            "input[placeholder*='Code']",
-            "input[placeholder*='verification']",
-            "input[maxlength='6']",
-            "input[maxlength='4']",
+            "input[name='code']", "input[name='verificationCode']", "input[name='otp']",
+            "input[id='verification-code']", "input[placeholder*='code' i]",
+            "input[maxlength='6']", "input[maxlength='4']",
         ]
-        
-        task_id = "unknown"
-        
         for selector in verification_selectors:
             try:
                 element = await page.query_selector(selector)
                 if element and await element.is_visible():
-                    logger.info(f"Verification field found: {selector}")
-                    
-                    # Check for blocking elements first
-                    blocked, block_selector = await self._check_for_blocking_elements(page)
-                    if blocked:
-                        screenshot_path = await self._take_screenshot(page, task_id, "blocked_verification")
-                        return AutomationResult(
-                            status=TaskStatus.REQUIRES_MANUAL_INTERVENTION,
-                            error_message=f"CAPTCHA appeared during verification: {block_selector}",
-                            screenshot_path=screenshot_path,
-                        )
-                    
-                    # Get verification code from inbox
-                    code = await self._inbox_service.get_verification_code(
-                        request.email, timeout_seconds=120
-                    )
-                    
+                    code = await self._inbox_service.get_verification_code(request.email, timeout_seconds=120)
                     if code:
                         await element.fill("")
                         await element.type(code, delay=random.uniform(50, 150))
-                        
-                        # Look for verify button
                         verify_button = await page.query_selector(
                             "button:has-text('Verify'), button:has-text('Confirm'), button:has-text('Submit')"
                         )
                         if verify_button:
                             await verify_button.click()
-                            
                         await self._human_delay(2000, 4000)
-                        
-                        # Check for success
-                        if await self._check_success(page):
-                            return None  # Success, continue normally
-                    else:
-                        screenshot_path = await self._take_screenshot(page, task_id, "no_verification_code")
-                        return AutomationResult(
-                            status=TaskStatus.FAILED,
-                            error_message="Could not retrieve verification code from inbox",
-                            screenshot_path=screenshot_path,
-                        )
                     break
             except Exception:
                 continue
-        
         return None
 
     async def _check_success(self, page: Page) -> bool:
-        """Check if the page indicates successful account creation."""
         success_indicators = [
-            "[class*='success']",
-            "[class*='confirmed']",
-            "[class*='welcome']",
-            "text='Account created'",
-            "text='Welcome'",
-            "text='Verified'",
-            "text='Confirmation'",
-            "text='Success'",
+            "[class*='success']", "[class*='confirmed']", "[class*='welcome']",
+            "text='Account created'", "text='Welcome'", "text='Verified'",
         ]
-        
         for indicator in success_indicators:
             try:
                 if "text=" in indicator:
@@ -497,5 +708,4 @@ class BrowserAgent:
                         return True
             except Exception:
                 continue
-        
         return False

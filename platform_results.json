@@ -1,0 +1,36 @@
+{
+  "bluesky": {
+    "status": "TaskStatus.FAILED",
+    "result": null,
+    "error": "Bluesky error: ElementHandle.click: Timeout 30000ms exceeded.\nCall log:\n  - attempting click action\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div role=\"dialog\" aria-modal=\"true\" class=\"css-g5y9jx r-1xcajam\">\u2026</div> intercepts pointer events\n    - retrying click action\n    - waiting 20ms\n    2 \u00d7 waiting for element to be visible, enabled and stable\n      - element is visible, enabled and stable\n      - scrolling into view if needed\n      - done scrolling\n      - <div role=\"dialog\" aria-modal=\"true\" class=\"css-g5y9jx r-1xcajam\">\u2026</div> intercepts pointer events\n    - retrying click action\n      - waiting 100ms\n    58 \u00d7 waiting for element to be visible, enabled and stable\n       - element is visible, enabled and stable\n       - scrolling into view if needed\n       - done scrolling\n       - <div role=\"dialog\" aria-modal=\"true\" class=\"css-g5y9jx r-1xcajam\">\u2026</div> intercepts pointer events\n     - retrying click action\n       - waiting 500ms\n",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/bluesky_error_bluesky_1783070608.png"
+  },
+  "mastodon": {
+    "status": "TaskStatus.REQUIRES_MANUAL_INTERVENTION",
+    "result": null,
+    "error": "Mastodon: unexpected URL after login: https://mastodon.social/auth/sign_in",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/mastodon_done_mastodon_1783070622.png"
+  },
+  "lemmy": {
+    "status": "TaskStatus.COMPLETED",
+    "result": {
+      "platform": "lemmy",
+      "email": "tal.derie.td@gmail.com",
+      "url_after": "https://lemmy.world/login"
+    },
+    "error": null,
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/lemmy_done_lemmy_1783070641.png"
+  },
+  "hackernews": {
+    "status": "TaskStatus.REQUIRES_MANUAL_INTERVENTION",
+    "result": null,
+    "error": "HackerNews: bad credentials or login page still shown",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/hn_done_hackernews_1783070649.png"
+  },
+  "discord": {
+    "status": "TaskStatus.REQUIRES_MANUAL_INTERVENTION",
+    "result": null,
+    "error": "Discord: blocking element [class*='captcha']",
+    "screenshot": "/home/ubuntu/epsilon-agent/app/screenshots/discord_blocked_discord_1783070698.png"
+  }
+}
